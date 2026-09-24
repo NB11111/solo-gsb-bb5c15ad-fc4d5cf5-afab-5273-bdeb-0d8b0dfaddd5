@@ -28,6 +28,15 @@
 （shift = (T + o) mod C），再与请求的发车范围
 ``[depart_from, depart_to)`` 求交；各路口结果两两求交并合并相邻
 （端点相接）区间，即得全部极大半开发车窗口。全程只做区间运算，不逐秒试探。
+
+最大覆盖
+--------
+:func:`compute_max_coverage` 复用上述**单路口可行窗口**：对范围内每个整数
+出发时刻，统计"行驶时间取 [T, T_max] 内任意实数仍遇绿"的路口数（覆盖数）。
+覆盖数只可能在某个可行窗口的端点处变化，故把每个半开窗口 ``[a,b)`` 记为
+``a`` 处 +1、``b`` 处 -1 的差分事件，按位置排序后逐段扫描即可，不逐秒统计。
+取全局最大覆盖数，合并相邻（端点相接）的最优段，即得全部极大半开发车区间；
+最大值为 0 时没有任何事件，唯一的极大区间即完整发车范围。
 """
 
 from __future__ import annotations
@@ -209,6 +218,75 @@ def compute_windows(
             return []
     # 求交不会产生相接区间，最后再合并一次以策安全。
     return merge_intervals(common or [])
+
+
+def compute_max_coverage(
+    intersections: Iterable[dict],
+    depart_from: int,
+    depart_to: int,
+) -> tuple[int, list[Interval]]:
+    """求范围内"最多有多少个路口任意行驶时长下都遇绿"及全部极大最优区间。
+
+    对发车范围 ``[depart_from, depart_to)`` 内的每个整数出发时刻 t，覆盖数
+    为满足下述条件的路口数：行驶时间取 ``[T, T_max]`` 内**任意实数**时抵达
+    该路口都遇绿灯（即可行窗口的判定与 :func:`compute_windows` 完全一致，
+    直接复用 :func:`departure_windows_for_intersection`）。
+
+    返回 ``(最大覆盖数, 极大半开区间列表)``：区间按起点升序，区间内每个出发
+    时刻的覆盖数都等于最大值，且区间两端已覆盖数下降或到达发车范围边界。
+    采用区间端点事件扫描（每个可行窗口在起点 +1、终点 -1），覆盖数只在端点
+    处变化，故不逐秒统计；最大值为 0（无任何事件）时返回
+    ``(0, [[depart_from, depart_to]])``，即完整发车范围仍是唯一的极大区间。
+    """
+    # 事件：(位置, 增量)。半开窗口 [a,b) 内贡献 1，故 a 处 +1、b 处 -1。
+    events: list[tuple[int, int]] = []
+    for item in intersections:
+        for start, end in departure_windows_for_intersection(
+            cycle=item["cycle"],
+            offset=item["offset"],
+            green_start=item["green_start"],
+            green_end=item["green_end"],
+            travel=item["travel"],
+            travel_max=item.get("travel_max"),
+            depart_from=depart_from,
+            depart_to=depart_to,
+        ):
+            events.append((start, 1))
+            events.append((end, -1))
+
+    if not events:
+        # 没有任何路口在范围内可行（含范围上的退化情形）：覆盖数恒为 0。
+        return 0, [[depart_from, depart_to]]
+
+    events.sort()
+    segments: list[tuple[int, int, int]] = []  # (起点, 终点, 覆盖数)
+    coverage = 0
+    prev = depart_from
+    i = 0
+    while i < len(events):
+        pos = events[i][0]
+        if prev < pos:
+            segments.append((prev, pos, coverage))
+        delta = 0
+        while i < len(events) and events[i][0] == pos:
+            delta += events[i][1]
+            i += 1
+        coverage += delta
+        prev = pos
+    if prev < depart_to:
+        segments.append((prev, depart_to, coverage))
+
+    maximum = max(seg[2] for seg in segments)
+    # 合并相邻（端点相接）且同为最大覆盖数的段，得到全部极大半开区间。
+    optimal: list[Interval] = []
+    for start, end, value in segments:
+        if value != maximum:
+            continue
+        if optimal and optimal[-1][1] == start:
+            optimal[-1][1] = end
+        else:
+            optimal.append([start, end])
+    return maximum, optimal
 
 
 # ---------- 单路口 offset 诊断 ----------

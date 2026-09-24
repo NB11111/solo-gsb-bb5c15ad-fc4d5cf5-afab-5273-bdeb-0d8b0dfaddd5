@@ -2,8 +2,16 @@ import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
 
-from app.main import green_wave_offset_diagnostics, green_wave_windows
-from app.schemas import GreenWaveRequest, Intersection, OffsetDiagnosticsRequest
+from app.main import (
+    green_wave_max_coverage,
+    green_wave_offset_diagnostics,
+    green_wave_windows,
+)
+from app.schemas import (
+    GreenWaveRequest,
+    Intersection,
+    OffsetDiagnosticsRequest,
+)
 
 
 def make_request(payload):
@@ -195,6 +203,66 @@ def test_travel_max_86400_boundary_accepted():
     req.validate_ranges()
     windows = green_wave_windows(req)
     assert [[w.start, w.end] for w in windows] == [[0, 60]]
+
+
+# ---------- POST /api/green-wave/max-coverage ----------
+
+def test_max_coverage_payload_overlap():
+    req = make_request(
+        {
+            "depart_from": 0,
+            "depart_to": 120,
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 40, "travel": 0},
+                {"cycle": 60, "offset": 0, "green_start": 20, "green_end": 50, "travel": 0},
+            ],
+        }
+    )
+    resp = green_wave_max_coverage(req)
+    assert resp.max_coverage == 2
+    assert [[w.start, w.end] for w in resp.optimal_intervals] == [
+        [20, 40], [80, 100],
+    ]
+
+
+def test_max_coverage_zero_returns_complete_range():
+    req = make_request(
+        {
+            "depart_from": 10,
+            "depart_to": 70,
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 20, "green_end": 40,
+                 "travel": 0, "travel_max": 30}
+            ],
+        }
+    )
+    resp = green_wave_max_coverage(req)
+    assert resp.max_coverage == 0
+    assert [[w.start, w.end] for w in resp.optimal_intervals] == [[10, 70]]
+
+
+def test_max_coverage_reuses_request_validation():
+    # 与 /windows 相同的跨字段校验：发车范围超过 3600 秒仍返回 422。
+    req = make_request(
+        {
+            "depart_from": 0,
+            "depart_to": 3601,
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 10, "travel": 0}
+            ],
+        }
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_max_coverage(req)
+    assert exc.value.status_code == 422
+
+
+def test_max_coverage_route_is_in_openapi():
+    from app.main import app
+
+    paths = app.openapi()["paths"]
+    assert "/api/green-wave/max-coverage" in paths
+    assert "post" in paths["/api/green-wave/max-coverage"]
 
 
 # ---------- POST /api/green-wave/offset-diagnostics ----------

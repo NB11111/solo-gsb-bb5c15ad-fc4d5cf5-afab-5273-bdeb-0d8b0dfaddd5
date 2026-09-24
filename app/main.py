@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
-from .greenwave import compute_windows, offset_diagnostics
+from .greenwave import compute_max_coverage, compute_windows, offset_diagnostics
 from .schemas import (
     GreenWaveRequest,
+    MaxCoverageResponse,
     OffsetDiagnosticsRequest,
     OffsetDiagnosticsResponse,
     OffsetInterval,
@@ -25,10 +26,26 @@ app = FastAPI(
         "给定一个路口的周期、绿灯相位及 1..2000 条（到达时刻, 实际灯色）"
         "观测，对整数 offset∈[0,cycle) 按 (arrival_time+offset) mod cycle "
         "预测灯色，返回最少错配条数与取到该值的全部极大半开 offset 区间"
-        "（周期区间事件扫描，不逐一计算 offset×观测）。"
+        "（周期区间事件扫描，不逐一计算 offset×观测）。\n\n"
+        "另有最大覆盖接口 `POST /api/green-wave/max-coverage`：对范围内每个"
+        "出发时刻统计（任意行驶时长抵达都）遇绿的路口数，返回全局最大路口数"
+        "及取到该值的全部极大半开发车区间（复用单路口可行窗口并按区间端点"
+        "扫描覆盖数，不逐秒统计）。"
     ),
-    version="1.1.0",
+    version="1.2.0",
 )
+
+
+def _intersection_payload(item) -> dict:
+    """把请求中的路口模型转换为算法层使用的参数字典。"""
+    return {
+        "cycle": item.cycle,
+        "offset": item.offset,
+        "green_start": item.green_start,
+        "green_end": item.green_end,
+        "travel": item.travel,
+        "travel_max": item.effective_travel_max,
+    }
 
 
 @app.get("/health", tags=["系统"], summary="健康检查")
@@ -46,20 +63,35 @@ def green_wave_windows(request: GreenWaveRequest) -> list[Window]:
     request.validate_ranges()
     windows = compute_windows(
         intersections=[
-            {
-                "cycle": item.cycle,
-                "offset": item.offset,
-                "green_start": item.green_start,
-                "green_end": item.green_end,
-                "travel": item.travel,
-                "travel_max": item.effective_travel_max,
-            }
-            for item in request.intersections
+            _intersection_payload(item) for item in request.intersections
         ],
         depart_from=request.depart_from,
         depart_to=request.depart_to,
     )
     return [Window(start=start, end=end) for start, end in windows]
+
+
+@app.post(
+    "/api/green-wave/max-coverage",
+    response_model=MaxCoverageResponse,
+    tags=["绿波"],
+    summary="计算最大遇绿路口数及取到该值的全部极大发车区间",
+)
+def green_wave_max_coverage(request: GreenWaveRequest) -> MaxCoverageResponse:
+    request.validate_ranges()
+    maximum, intervals = compute_max_coverage(
+        intersections=[
+            _intersection_payload(item) for item in request.intersections
+        ],
+        depart_from=request.depart_from,
+        depart_to=request.depart_to,
+    )
+    return MaxCoverageResponse(
+        max_coverage=maximum,
+        optimal_intervals=[
+            Window(start=start, end=end) for start, end in intervals
+        ],
+    )
 
 
 @app.post(

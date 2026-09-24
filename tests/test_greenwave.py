@@ -1,6 +1,7 @@
 import pytest
 
 from app.greenwave import (
+    compute_max_coverage,
     compute_windows,
     departure_windows_for_intersection,
     eroded_green_components,
@@ -210,6 +211,134 @@ def test_compute_windows_with_fluctuation_multi_intersection():
     nodes[1] = it(cycle=60, offset=10, green_start=0, green_end=20,
                   travel=10, travel_max=20)
     assert compute_windows(nodes, 0, 120) == []
+
+
+# ---------- 最大覆盖（端点事件扫描，含暴力对照） ----------
+
+def test_max_coverage_counts_intersections_and_merges_adjacent():
+    # 路口 1 可行 [0,30) [60,90)；路口 2 可行 [30,40) [90,100)。
+    # 覆盖数恒为 1；相邻端点相接（30/30、90/90，且跨周期 60 相接处亦然），
+    # 合并为整段 [0,100)（中间 [40,60) 覆盖为 0，故不能跨过去）。
+    nodes = [
+        it(cycle=60, green_start=0, green_end=30, travel=0),
+        it(cycle=60, green_start=30, green_end=40, travel=0),
+    ]
+    assert compute_max_coverage(nodes, 0, 120) == (
+        1, [[0, 40], [60, 100]]
+    )
+
+
+def test_max_coverage_overlap_takes_maximum():
+    # [0,40) 与 [20,60) 周期 60：重叠段 [20,40) 内覆盖 2，其余为 1。
+    nodes = [
+        it(cycle=60, green_start=0, green_end=40, travel=0),
+        it(cycle=60, green_start=20, green_end=60, travel=0),
+    ]
+    assert compute_max_coverage(nodes, 0, 120) == (
+        2, [[20, 40], [80, 100]]
+    )
+
+
+def test_max_coverage_all_feasible_yields_full_range():
+    nodes = [it(travel=i * 5) for i in range(8)]  # 全周期常绿
+    assert compute_max_coverage(nodes, 100, 400) == (8, [[100, 400]])
+
+
+def test_max_coverage_zero_returns_full_range():
+    # 波动量超过绿灯长度：该路口永不可行，覆盖数恒为 0，仍返回完整发车范围。
+    node = it(
+        cycle=60, green_start=20, green_end=40, travel=0, travel_max=30
+    )
+    assert compute_max_coverage([node], 0, 120) == (0, [[0, 120]])
+
+
+def test_max_coverage_range_not_aligned_to_cycle():
+    # 范围 [25, 95)：可行段 [20,40) [80,100) 裁剪后 [25,40) [80,95)，
+    # 其余时刻覆盖 0；最大值 1，只返回这两段而非整段范围。
+    node = it(cycle=60, green_start=20, green_end=40, travel=0)
+    assert compute_max_coverage([node], 25, 95) == (
+        1, [[25, 40], [80, 95]]
+    )
+
+
+def test_max_coverage_half_open_endpoint_not_counted():
+    # 绿灯 [20,30)：t=30 不可行，最优（覆盖 1）段为 [20,30) 而非 [20,31)。
+    node = it(cycle=60, green_start=20, green_end=30, travel=0)
+    assert compute_max_coverage([node], 20, 31) == (1, [[20, 30]])
+
+
+def test_max_coverage_wrapping_green_with_fluctuation():
+    # 跨零点 [50,60)∪[0,10)、行驶 [0,10]：先连续再收缩 ⇔ 可行 [50,60) 周期 60。
+    node = it(
+        cycle=60, green_start=50, green_end=10, travel=0, travel_max=10
+    )
+    assert compute_max_coverage([node], 0, 130) == (
+        1, [[50, 60], [110, 120]]
+    )
+
+
+def test_max_coverage_brute_force_equivalence_on_random_cases():
+    """与逐秒统计覆盖数的参考实现完全一致（测试本身才允许逐秒）。"""
+    import random
+
+    random.seed(123)
+
+    def feasible(node, t):
+        """整数出发时刻 t 在任意实数行驶时间下是否对该路口可行。"""
+        tmax = node.get("travel_max", node["travel"])
+        arrive_lo = t + node["travel"] + node["offset"]
+        arrive_hi = t + tmax + node["offset"]
+        gs, ge, c = node["green_start"], node["green_end"], node["cycle"]
+        if gs == ge:
+            return True
+        for q in range(arrive_lo // c - 2, arrive_lo // c + 4):
+            if gs < ge:
+                a, b = q * c + gs, q * c + ge
+            else:  # 跨零点：连续分量 [qC+gs, (q+1)C+ge)
+                a, b = q * c + gs, (q + 1) * c + ge
+            if a <= arrive_lo and arrive_hi < b:
+                return True
+        return False
+
+    def brute(nodes, lo, hi):
+        values = [sum(feasible(n, t) for n in nodes) for t in range(lo, hi)]
+        maximum = max(values)
+        expected: list[list[int]] = []
+        run_start = None
+        for idx, value in enumerate(values):
+            if value == maximum:
+                if run_start is None:
+                    run_start = lo + idx
+            else:
+                if run_start is not None:
+                    expected.append([run_start, lo + idx])
+                    run_start = None
+        if run_start is not None:
+            expected.append([run_start, hi])
+        return maximum, expected
+
+    for _ in range(400):
+        n_nodes = random.randint(1, 8)
+        nodes = []
+        for _ in range(n_nodes):
+            c = random.randint(1, 90)
+            gs = random.randint(0, c - 1)
+            ge = random.randint(0, c - 1)
+            travel = random.randint(0, 120)
+            kwargs = dict(
+                cycle=c,
+                offset=random.randint(0, c - 1),
+                green_start=gs,
+                green_end=ge,
+                travel=travel,
+            )
+            if random.random() < 0.5:
+                kwargs["travel_max"] = travel + random.randint(0, 30)
+            nodes.append(it(**kwargs))
+        length = random.randint(1, 600)
+        lo = random.randint(0, 300)
+        hi = lo + length
+        assert compute_max_coverage(nodes, lo, hi) == brute(nodes, lo, hi)
 
 
 def test_brute_force_equivalence_on_random_cases():

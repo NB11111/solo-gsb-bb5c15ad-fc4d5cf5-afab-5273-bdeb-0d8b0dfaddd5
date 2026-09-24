@@ -118,6 +118,22 @@ class Window(BaseModel):
 GreenWaveResponse = list[Window]
 
 
+class MaxCoverageResponse(BaseModel):
+    """最大绿波覆盖结果：全局最大遇绿路口数及取到该值的全部极大发车区间。"""
+
+    max_coverage: int = Field(
+        ..., ge=0, description="发车范围内任意出发时刻可遇绿路口数的全局最大值"
+    )
+    optimal_intervals: list[Window] = Field(
+        ...,
+        description=(
+            "覆盖数取到最大值的全部极大半开发车区间 [start,end)，按起点升序；"
+            "最大值为 0 时为完整的请求发车范围 "
+            "[depart_from, depart_to)"
+        ),
+    )
+
+
 class OffsetObservation(BaseModel):
     """一条车辆到达观测：整数秒绝对到达时刻与当时是否绿灯。"""
 
