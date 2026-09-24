@@ -2,8 +2,16 @@ import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
 
-from app.main import green_wave_offset_diagnostics, green_wave_windows
-from app.schemas import GreenWaveRequest, Intersection, OffsetDiagnosticsRequest
+from app.main import (
+    green_wave_max_coverage,
+    green_wave_offset_diagnostics,
+    green_wave_windows,
+)
+from app.schemas import (
+    GreenWaveRequest,
+    Intersection,
+    OffsetDiagnosticsRequest,
+)
 
 
 def make_request(payload):
@@ -195,6 +203,105 @@ def test_travel_max_86400_boundary_accepted():
     req.validate_ranges()
     windows = green_wave_windows(req)
     assert [[w.start, w.end] for w in windows] == [[0, 60]]
+
+
+# ---------- POST /api/green-wave/max-coverage ----------
+
+def test_max_coverage_payload_overlap():
+    # A 可行 [0,30)；B 绿灯同为 [0,30) 但 offset=40，出发窗口前移为 [20,50)：
+    # 覆盖 2 仅在 [20,30)
+    req = make_request(
+        {
+            "depart_from": 0,
+            "depart_to": 60,
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 30, "travel": 0},
+                {"cycle": 60, "offset": 40, "green_start": 0, "green_end": 30, "travel": 0},
+            ],
+        }
+    )
+    resp = green_wave_max_coverage(req)
+    assert resp.max_coverage == 2
+    assert [[w.start, w.end] for w in resp.optimal_intervals] == [[20, 30]]
+
+
+def test_max_coverage_payload_merges_adjacent():
+    # 两路口可行段端点相接：最大 1 的合并段为 [0,20)
+    req = make_request(
+        {
+            "depart_from": 0,
+            "depart_to": 60,
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 10, "travel": 0},
+                {"cycle": 60, "offset": 0, "green_start": 10, "green_end": 20, "travel": 0},
+            ],
+        }
+    )
+    resp = green_wave_max_coverage(req)
+    assert resp.max_coverage == 1
+    assert [[w.start, w.end] for w in resp.optimal_intervals] == [[0, 20]]
+
+
+def test_max_coverage_zero_returns_full_range():
+    # 波动吃掉绿灯：最大 0，仍返回完整发车范围
+    req = make_request(
+        {
+            "depart_from": 30,
+            "depart_to": 90,
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 20, "green_end": 40,
+                 "travel": 0, "travel_max": 25}
+            ],
+        }
+    )
+    resp = green_wave_max_coverage(req)
+    assert resp.max_coverage == 0
+    assert [[w.start, w.end] for w in resp.optimal_intervals] == [[30, 90]]
+
+
+def test_max_coverage_with_travel_max():
+    # 常绿 + 波动收缩后的周期绿灯：最大 2 仅在收缩段
+    req = make_request(
+        {
+            "depart_from": 0,
+            "depart_to": 120,
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 0,
+                 "travel": 0},
+                {"cycle": 60, "offset": 0, "green_start": 20, "green_end": 40,
+                 "travel": 0, "travel_max": 10},
+            ],
+        }
+    )
+    resp = green_wave_max_coverage(req)
+    assert resp.max_coverage == 2
+    assert [[w.start, w.end] for w in resp.optimal_intervals] == [
+        [20, 30], [80, 90]
+    ]
+
+
+def test_max_coverage_reuses_request_validation():
+    # 与 /windows 相同的请求与校验：范围超长直接 422
+    req = make_request(
+        {
+            "depart_from": 0,
+            "depart_to": 3601,
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 10, "travel": 0}
+            ],
+        }
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_max_coverage(req)
+    assert exc.value.status_code == 422
+
+
+def test_max_coverage_route_is_in_openapi():
+    from app.main import app
+
+    paths = app.openapi()["paths"]
+    assert "/api/green-wave/max-coverage" in paths
+    assert "post" in paths["/api/green-wave/max-coverage"]
 
 
 # ---------- POST /api/green-wave/offset-diagnostics ----------

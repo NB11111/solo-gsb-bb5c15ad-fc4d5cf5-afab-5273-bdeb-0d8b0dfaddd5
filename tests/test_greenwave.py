@@ -1,6 +1,7 @@
 import pytest
 
 from app.greenwave import (
+    compute_max_coverage,
     compute_windows,
     departure_windows_for_intersection,
     eroded_green_components,
@@ -282,3 +283,199 @@ def test_brute_force_equivalence_on_random_cases():
         lo = random.randint(0, 300)
         hi = lo + length
         assert compute_windows(nodes, lo, hi) == brute(nodes, lo, hi)
+
+
+# ---------- 最大覆盖路口数（端点差分扫描） ----------
+
+def test_max_coverage_single_intersection():
+    # 单路口绿灯 [20,40) 周期 60：覆盖 1 的段即其可行窗口，其余处为 0
+    nodes = [it(cycle=60, green_start=20, green_end=40, travel=0)]
+    maximum, intervals = compute_max_coverage(nodes, 0, 140)
+    assert maximum == 1
+    assert intervals == [[20, 40], [80, 100]]
+
+
+def test_max_coverage_zero_when_never_feasible():
+    # 波动量吃掉整条绿灯：没有任何可行时刻，最大值 0，仍返回完整发车范围
+    nodes = [it(cycle=60, green_start=20, green_end=40, travel=0, travel_max=25)]
+    maximum, intervals = compute_max_coverage(nodes, 30, 90)
+    assert maximum == 0
+    assert intervals == [[30, 90]]
+
+
+def test_max_coverage_zero_windows_have_empty_interiors():
+    # 两个路口各自可行但互不交叠：覆盖数最大 1；0 段不作为最优输出
+    nodes = [
+        it(cycle=60, green_start=0, green_end=10, travel=0),
+        it(cycle=60, green_start=20, green_end=30, travel=0),
+    ]
+    maximum, intervals = compute_max_coverage(nodes, 0, 60)
+    assert maximum == 1
+    assert intervals == [[0, 10], [20, 30]]
+
+
+def test_max_coverage_merges_adjacent_optimal_segments():
+    # 路口 A 可行 [0,10)，路口 B 可行 [10,20)：10 处覆盖数恒为 1
+    # （A 的 -1 与 B 的 +1 在同一端点相消），两段须合并为 [0,20)
+    nodes = [
+        it(cycle=60, green_start=0, green_end=10, travel=0),
+        it(cycle=60, green_start=10, green_end=20, travel=0),
+    ]
+    maximum, intervals = compute_max_coverage(nodes, 0, 60)
+    assert maximum == 1
+    assert intervals == [[0, 20]]
+
+
+def test_max_coverage_overlapping_pairs():
+    # A: [0,30)；B: [20,50)。覆盖数：[0,20)->1，[20,30)->2，[30,50)->1
+    nodes = [
+        it(cycle=60, green_start=0, green_end=30, travel=0),
+        it(cycle=60, green_start=20, green_end=50, travel=0),
+    ]
+    maximum, intervals = compute_max_coverage(nodes, 0, 60)
+    assert maximum == 2
+    assert intervals == [[20, 30]]
+
+
+def test_max_coverage_all_green_and_periodic_mix():
+    # 常绿路口处处 +1；周期路口可行 [10,20) 时覆盖 2，其余处为 1
+    nodes = [
+        it(cycle=60, green_start=0, green_end=0, travel=0),
+        it(cycle=60, green_start=10, green_end=20, travel=0),
+    ]
+    maximum, intervals = compute_max_coverage(nodes, 0, 60)
+    assert maximum == 2
+    assert intervals == [[10, 20]]
+
+
+def test_max_coverage_all_always_green_covers_whole_range():
+    nodes = [it(travel=i) for i in range(3)]
+    maximum, intervals = compute_max_coverage(nodes, 100, 400)
+    assert maximum == 3
+    assert intervals == [[100, 400]]
+
+
+def test_max_coverage_wrapping_green_adjacent_repetitions_merge():
+    # 跨零点绿灯 [50,60)∪[0,10)，行驶 5：可行段 [45,65) 是连续的一段
+    # （周期展开后两端相接已由单路口窗口合并），覆盖 1 即该段
+    nodes = [it(cycle=60, green_start=50, green_end=10, travel=5)]
+    maximum, intervals = compute_max_coverage(nodes, 0, 125)
+    assert maximum == 1
+    assert intervals == [[0, 5], [45, 65], [105, 125]]
+
+
+def test_max_coverage_clipped_to_range_boundaries():
+    # 可行段 [-15,5)/[45,65)/[105,125)：范围落在两段之间时覆盖数为 0
+    nodes = [it(cycle=60, green_start=50, green_end=10, travel=5)]
+    maximum, intervals = compute_max_coverage(nodes, 30, 45)
+    assert maximum == 0
+    assert intervals == [[30, 45]]
+    # 范围与可行段部分相交时按半开边界裁剪
+    maximum, intervals = compute_max_coverage(nodes, 47, 50)
+    assert maximum == 1
+    assert intervals == [[47, 50]]
+    # 范围恰好在可行段左端点结束：[30,45) 与 [45,65) 无交（45 不含）
+    maximum, intervals = compute_max_coverage(nodes, 30, 46)
+    assert (maximum, intervals) == (1, [[45, 46]])
+
+
+def test_max_coverage_with_travel_max_fluctuation():
+    # 绿灯 [20,40)、行驶 [0,10]：单路口收缩为 [20,30)，覆盖 1 仅在收缩段
+    nodes = [
+        it(cycle=60, green_start=20, green_end=40, travel=0, travel_max=10)
+    ]
+    maximum, intervals = compute_max_coverage(nodes, 0, 120)
+    assert maximum == 1
+    assert intervals == [[20, 30], [80, 90]]
+
+
+def test_max_coverage_three_nodes_step_profile():
+    # A: [0,40)；B: [10,30)；C: [20,50)，周期 60
+    # 覆盖：[0,10)->1 [10,20)->2 [20,30)->3 [30,40)->2 [40,50)->1
+    nodes = [
+        it(cycle=60, green_start=0, green_end=40, travel=0),
+        it(cycle=60, green_start=10, green_end=30, travel=0),
+        it(cycle=60, green_start=20, green_end=50, travel=0),
+    ]
+    maximum, intervals = compute_max_coverage(nodes, 0, 60)
+    assert maximum == 3
+    assert intervals == [[20, 30]]
+
+
+def test_max_coverage_multiple_disjoint_maximum_segments():
+    # 三路口每周期均在 [0,10) 可行；最大 3 的段在范围内出现两次，不合并
+    nodes = [
+        it(cycle=60, offset=0, green_start=0, green_end=10, travel=0),
+        it(cycle=60, offset=0, green_start=0, green_end=10, travel=0),
+        it(cycle=60, offset=0, green_start=0, green_end=10, travel=0),
+    ]
+    maximum, intervals = compute_max_coverage(nodes, 0, 130)
+    assert maximum == 3
+    assert intervals == [[0, 10], [60, 70], [120, 130]]
+
+
+def test_max_coverage_brute_force_equivalence_on_random_cases():
+    """与逐秒统计覆盖数的参考实现完全一致（测试本身才允许逐秒）。"""
+    import random
+
+    random.seed(7)
+
+    def brute(nodes, lo, hi):
+        best = -1
+        best_intervals = []
+        run_start = None
+        for t in range(lo, hi):
+            count = 0
+            for n in nodes:
+                tmax = n.get("travel_max", n["travel"])
+                arrive_lo = t + n["travel"] + n["offset"]
+                arrive_hi = t + tmax + n["offset"]
+                gs, ge, c = n["green_start"], n["green_end"], n["cycle"]
+                if gs == ge:
+                    count += 1
+                    continue
+                q0 = arrive_lo // c - 2
+                for q in range(q0, q0 + 6):
+                    if gs < ge:
+                        comp = (q * c + gs, q * c + ge)
+                    else:
+                        comp = (q * c + gs, (q + 1) * c + ge)
+                    if comp[0] <= arrive_lo and arrive_hi < comp[1]:
+                        count += 1
+                        break
+            if count > best:
+                best = count
+                best_intervals = [[t, t + 1]]
+                run_start = t
+            elif count == best:
+                if run_start is not None:
+                    best_intervals[-1][1] = t + 1
+                else:
+                    best_intervals.append([t, t + 1])
+                    run_start = t
+            else:
+                run_start = None
+        return best, best_intervals
+
+    for _ in range(400):
+        n_nodes = random.randint(1, 8)
+        nodes = []
+        for _ in range(n_nodes):
+            c = random.randint(1, 90)
+            gs = random.randint(0, c - 1)
+            ge = random.randint(0, c - 1)
+            travel = random.randint(0, 120)
+            kwargs = dict(
+                cycle=c,
+                offset=random.randint(0, c - 1),
+                green_start=gs,
+                green_end=ge,
+                travel=travel,
+            )
+            if random.random() < 0.5:
+                kwargs["travel_max"] = travel + random.randint(0, 30)
+            nodes.append(it(**kwargs))
+        length = random.randint(1, 600)
+        lo = random.randint(0, 300)
+        hi = lo + length
+        assert compute_max_coverage(nodes, lo, hi) == brute(nodes, lo, hi)

@@ -2,7 +2,7 @@
 
 基于 **Python 3.11 + FastAPI** 的干线（arterial）绿波发车窗口计算服务。
 
-提供两个接口：
+提供三个接口：
 
 1. **绿波发车窗口** `POST /api/green-wave/windows`：给定干线上至多 8 个路口各自的
    信号周期、相位偏移、周期内绿灯半开区间（允许跨周期零点）以及从起点到该路口的
@@ -10,7 +10,12 @@
    `[travel, travel_max]` 内任意实数秒），并给定一个不超过 3600 秒（一小时）的整数秒
    **半开**发车范围，服务返回在该范围内出发、**对任意可能的行驶时间**抵达**每个**路口时
    都恰好遇到绿灯的**全部极大半开发车区间**，按起点升序排列；不存在任何可行窗口时返回空数组 `[]`。
-2. **单路口 offset 诊断** `POST /api/green-wave/offset-diagnostics`：给定单个路口的
+2. **最大覆盖** `POST /api/green-wave/max-coverage`：请求体与接口 1 完全相同。对发车范围
+   内的每个出发时刻，统计按各路口行驶时间区间 `[travel, travel_max]` 内**任意实数**秒抵达
+   都能遇绿的路口数（即该时刻落在多少个路口的单路口可行窗口内），返回**全局最大路口数**
+   `max_coverage` 以及取到该值的**全部极大半开发车区间**（相邻最优段已合并，按起点升序）；
+   最大值为 0 时仍返回完整发车范围 `[depart_from, depart_to)`。
+3. **单路口 offset 诊断** `POST /api/green-wave/offset-diagnostics`：给定单个路口的
    `cycle`、`green_start`、`green_end` 及 1～2000 条 `{arrival_time, observed_green}`
    观测（时间均为整数秒），对每个整数 `offset ∈ [0, cycle)` 按
    `(arrival_time + offset) mod cycle` 预测灯色，返回**最少错配条数**以及取到该值的
@@ -74,6 +79,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | --- | --- |
 | 健康检查 | `GET http://localhost:8000/health` |
 | 绿波窗口计算 | `POST http://localhost:8000/api/green-wave/windows` |
+| 最大覆盖路口数 | `POST http://localhost:8000/api/green-wave/max-coverage` |
 | 单路口 offset 诊断 | `POST http://localhost:8000/api/green-wave/offset-diagnostics` |
 | 交互式文档（Swagger UI） | `http://localhost:8000/docs` |
 | OpenAPI 描述 | `http://localhost:8000/openapi.json` |
@@ -253,6 +259,117 @@ curl -s -X POST http://localhost:8000/api/green-wave/windows \
 任何出发时刻都无法保证遇绿，该路口（进而整个请求）返回 `[]`；整周期常绿
 （`green_start == green_end`）不受波动影响。省略 `travel_max` 时语义与旧版完全一致。
 
+## 最大覆盖路口数
+
+`POST /api/green-wave/max-coverage` 的请求体、路口参数与校验与 `/windows`
+**完全一致**（同样的 `depart_from` / `depart_to` / `intersections`，同样的半开范围、
+周期、相位、`travel_max` 约束）。区别在于不要求**所有**路口同时可行，而是对范围内
+每个出发时刻 `t`，统计
+
+```
+cover(t) = 满足「行驶时间取 [travel, travel_max] 内任意实数秒抵达都遇绿」的路口数
+```
+
+即 `t` 落在多少个路口的**单路口可行窗口**内（其收缩、跨零点、常绿、半开边界语义与
+上文完全一致），然后返回：
+
+- `max_coverage`：发车范围内 `cover(t)` 的**全局最大值**（`0 .. 路口数`）；
+- `optimal_intervals`：取到最大值的**全部极大半开发车区间** `[start, end)`
+  （`start` 时刻达到最大值、`end` 时刻不再达到），相邻且同为最大值的段已合并，
+  按 `start` 升序；当 `max_coverage == 0`（没有任何路口存在可行时刻）时仍返回
+  **完整发车范围** `[{"start": depart_from, "end": depart_to}]`。
+
+成功响应：
+
+```json
+{
+  "max_coverage": 2,
+  "optimal_intervals": [{"start": 20, "end": 30}]
+}
+```
+
+### 示例 1：部分重叠取最大覆盖
+
+路口 1 绿灯为本地相位 `[0,30)`（行驶 0 秒），路口 2 同样绿灯 `[0,30)` 但
+`offset=40`（出发窗口前移 40 秒，即其可行出发段为 `[20,50)`）。发车范围 `[0,60)`：
+覆盖数在 `[0,20)` 为 1、`[20,30)` 为 2、`[30,50)` 回到 1，最大值 2 仅在 `[20,30)`：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/max-coverage \
+  -H "Content-Type: application/json" \
+  -d '{
+    "depart_from": 0,
+    "depart_to": 60,
+    "intersections": [
+      {"cycle": 60, "offset": 0,  "green_start": 0, "green_end": 30, "travel": 0},
+      {"cycle": 60, "offset": 40, "green_start": 0, "green_end": 30, "travel": 0}
+    ]
+  }'
+```
+
+响应：
+
+```json
+{"max_coverage": 2, "optimal_intervals": [{"start": 20, "end": 30}]}
+```
+
+### 示例 2：相邻最优段自动合并
+
+两个路口的可行段端点相接（路口 1 在 `[0,10)`、路口 2 在 `[10,20)`）：在相接端点 10
+处，一个路口的覆盖 -1 与另一个的 +1 同时发生、覆盖数恒为 1，因此最优段合并为一整段
+`[0,20)` 而不是两段：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/max-coverage \
+  -H "Content-Type: application/json" \
+  -d '{
+    "depart_from": 0,
+    "depart_to": 60,
+    "intersections": [
+      {"cycle": 60, "offset": 0, "green_start": 0,  "green_end": 10, "travel": 0},
+      {"cycle": 60, "offset": 0, "green_start": 10, "green_end": 20, "travel": 0}
+    ]
+  }'
+# {"max_coverage":1,"optimal_intervals":[{"start":0,"end":20}]}
+```
+
+### 示例 3：最大值为 0 仍返回完整范围
+
+绿灯 20 秒而行驶波动量 25 秒（`[0,25]`），收缩后任何出发时刻都无法保证遇绿。此时
+`max_coverage` 为 0，`optimal_intervals` 仍是完整的半开发车范围：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/max-coverage \
+  -H "Content-Type: application/json" \
+  -d '{
+    "depart_from": 30,
+    "depart_to": 90,
+    "intersections": [
+      {"cycle": 60, "offset": 0, "green_start": 20, "green_end": 40,
+       "travel": 0, "travel_max": 25}
+    ]
+  }'
+# {"max_coverage":0,"optimal_intervals":[{"start":30,"end":90}]}
+```
+
+整周期常绿路口在每个出发时刻都贡献 1（且不受 `travel_max` 波动影响）；跨周期零点的
+绿灯先连续化再收缩后参与计数，周期重复段与范围边界的裁剪规则同 `/windows`。
+
+### 最大覆盖的算法说明（区间端点差分扫描）
+
+先复用单路口逻辑求出每个路口在发车范围内的全部可行半开窗口，然后：
+
+1. 在每条窗口 `[a,b)` 的端点放置差分事件（`a` 处 +1，`b` 处 -1），全部事件按位置
+   排序；同一位置的事件（半开端点相接）一次性结算，保证段内覆盖数恒定；
+2. 从 `depart_from` 起逐段扫描，维护当前覆盖路口数，记录
+   `(段起点, 段终点, 覆盖数)`，直至 `depart_to`；
+3. 取最大覆盖数，把相邻且同为最大值的段合并为极大半开区间（按起点升序）。
+   没有任何事件（所有路口均永不可行）时直接返回
+   `(0, [[depart_from, depart_to]])`。
+
+复杂度约为 `O(路口数 × (范围长度 / 最小周期) 的对数级排序)`，与 `/windows` 一样只做
+区间运算，不逐秒试探。
+
 ## 单路口 offset 诊断
 
 `POST /api/green-wave/offset-diagnostics` 用于根据实际车辆到达观测反推路口最合适的
@@ -363,7 +480,8 @@ curl -s -X POST http://localhost:8000/api/green-wave/offset-diagnostics \
 { "detail": ["travel_max 不得小于 travel（路口 中山路）"] }
 ```
 
-字段类型错误、缺失字段也由 Pydantic 统一返回 422。
+字段类型错误、缺失字段也由 Pydantic 统一返回 422。`/api/green-wave/max-coverage`
+复用完全相同的请求体与校验规则，以上所有 422 情形同样适用。
 
 `/api/green-wave/offset-diagnostics` 同样在以下情况返回 422：
 
@@ -404,6 +522,8 @@ pytest -q
 ```
 
 测试包含边界场景（跨零点、偏移、范围边界、半开端点不含、无解、行驶时间波动
-`travel_max`）以及 400 组随机参数下与逐秒判定参考实现的逐项对照；offset 诊断
+`travel_max`）以及 400 组随机参数下与逐秒判定参考实现的逐项对照；最大覆盖接口另含
+相邻最优段合并、最大值 0 返回完整范围、常绿/跨零点/波动场景及 400 组随机参数下与
+逐秒覆盖统计的对照；offset 诊断
 另有 2000+ 组随机参数下与逐 offset 暴力实现的对照、跨零点分段、常绿灯、
 负到达时刻、周期 1 秒及 2000 条观测的性能用例。
